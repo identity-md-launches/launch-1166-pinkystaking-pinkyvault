@@ -326,6 +326,67 @@ contract PinkyVaultTest is Test {
         intake.complete(requestId, a, sig);
     }
 
+    function test_RefusesAnAnswerThePanelDidNotAgreeOn() public {
+        uint256 id = _make();
+        _close(id);
+        bytes32 requestId = _ask(id);
+        OracleAttestation.Attestation memory a = _attestation(id, 0, bytes16("x"));
+        a.agreed = 3;
+        bytes memory sig = _sign(a, SIGNER_PK);
+        vm.expectRevert(PinkyVault.InvalidAttestation.selector);
+        intake.complete(requestId, a, sig);
+
+        a = _attestation(id, 0, bytes16("x"));
+        a.agreed = 4;
+        sig = _sign(a, SIGNER_PK);
+        intake.complete(requestId, a, sig);
+        assertEq(uint8(_status(id)), uint8(PinkyVault.Status.Kept));
+    }
+
+    function test_ChangingThePanelDuringARequestDoesNotRefuseItsAnswer() public {
+        uint256 id = _make();
+        _close(id);
+        bytes32 requestId = _ask(id);
+        (, uint16 askedPanel, uint16 askedQuorum) = vault.terms(id);
+        assertEq(askedPanel, 5);
+        assertEq(askedQuorum, 4);
+        assertEq(vm.parseJsonUint(string(intake.bodyOf(requestId)), ".panelSize"), 5);
+
+        vm.prank(owner);
+        vault.setPanel(9, 6, 86_400);
+        _answer(id, requestId, MAX_OUT + 1);
+        assertEq(uint8(_status(id)), uint8(PinkyVault.Status.Broken));
+    }
+
+    function test_ARequestBoughtWithASmallerPanelIsStillAnswerable() public {
+        uint256 id = _make();
+        _close(id);
+        bytes32 first = _ask(id);
+        vm.prank(owner);
+        vault.setPanel(9, 6, 86_400);
+        vm.warp(vm.getBlockTimestamp() + 1 days);
+        bytes32 second = _ask(id);
+        assertEq(vm.parseJsonUint(string(intake.bodyOf(second)), ".panelSize"), 9);
+        (, uint16 askedPanel, uint16 askedQuorum) = vault.terms(id);
+        assertEq(askedPanel, 5);
+        assertEq(askedQuorum, 4);
+        _answer(id, first, 0);
+        assertEq(uint8(_status(id)), uint8(PinkyVault.Status.Kept));
+    }
+
+    function test_CallbackFitsTheIntakeStipendFromColdStorage() public {
+        uint256 id = _make();
+        _close(id);
+        bytes32 requestId = _ask(id);
+        OracleAttestation.Attestation memory a = _attestation(id, MAX_OUT + 1, bytes16("cold"));
+        bytes memory sig = _sign(a, SIGNER_PK);
+        vm.cool(address(vault));
+        vm.cool(address(intake));
+        uint256 gasUsed = intake.complete(requestId, a, sig);
+        assertLt(gasUsed, 200_000, "the Intake gives the callback 200,000 gas");
+        assertEq(uint8(_status(id)), uint8(PinkyVault.Status.Broken));
+    }
+
     function test_RefusesAnAnswerOfAnotherType() public {
         uint256 id = _make();
         _close(id);
@@ -360,7 +421,9 @@ contract PinkyVaultTest is Test {
 
     // ───────────────────────── no answer ─────────────────────────
 
-    function test_AskAgainAfterATimeoutAndTheOldRequestIsDead() public {
+    /// @dev Changed with the audit fix for third-party re-asks: a request the bond paid for stays
+    /// answerable until a verdict lands, so a late answer to the first request still counts.
+    function test_AskAgainAfterATimeoutAndEitherAnswerCounts() public {
         uint256 id = _make();
         _close(id);
         bytes32 first = _ask(id);
@@ -371,14 +434,101 @@ contract PinkyVaultTest is Test {
         bytes32 second = _ask(id);
         assertTrue(first != second);
         assertEq(_bond(id), BOND - 2 * PRICE);
+        assertEq(vault.promiseIdFor(address(intake), first), id);
+        assertEq(vault.promiseIdFor(address(intake), second), id);
 
-        OracleAttestation.Attestation memory a = _attestation(id, 0, bytes16("x"));
-        bytes memory sig = _sign(a, SIGNER_PK);
-        vm.expectRevert(PinkyVault.UnknownRequest.selector);
-        intake.complete(first, a, sig);
-
-        _answer(id, second, 0);
+        _answer(id, first, 0);
         assertEq(uint8(_status(id)), uint8(PinkyVault.Status.Kept));
+
+        OracleAttestation.Attestation memory a = _attestation(id, MAX_OUT + 1, bytes16("y"));
+        bytes memory sig = _sign(a, SIGNER_PK);
+        vm.expectRevert(PinkyVault.WrongStatus.selector);
+        intake.complete(second, a, sig);
+        assertEq(uint8(_status(id)), uint8(PinkyVault.Status.Kept));
+    }
+
+    function test_AThirdPartyReaskDoesNotTakeTheWatchersBounty() public {
+        uint256 id = _make();
+        _close(id);
+        _ask(id);
+        vm.warp(vm.getBlockTimestamp() + 1 days);
+        vm.roll(vm.getBlockNumber() + 1);
+        address griefer = makeAddr("griefer");
+        vm.prank(griefer);
+        bytes32 second = vault.ask(id);
+        (,,,,,,,,,,,, address asker,,,) = vault.promises(id);
+        assertEq(asker, watcher);
+
+        _answer(id, second, MAX_OUT + 1);
+        vault.payout(id);
+        uint256 left = BOND - 2 * PRICE;
+        assertEq(imd.balanceOf(watcher), left / 10);
+        assertEq(imd.balanceOf(griefer), 0);
+    }
+
+    function test_AMakerWhoAsksFirstYieldsTheBountyToTheWatcherWhoReasks() public {
+        uint256 id = _make();
+        _close(id);
+        vm.roll(vm.getBlockNumber() + vault.SETTLE_DELAY_BLOCKS());
+        vm.prank(maker);
+        vault.ask(id);
+        vm.warp(vm.getBlockTimestamp() + 1 days);
+        bytes32 second = _ask(id);
+        (,,,,,,,,,,,, address asker,,,) = vault.promises(id);
+        assertEq(asker, watcher);
+        _answer(id, second, MAX_OUT + 1);
+        vault.payout(id);
+        assertEq(imd.balanceOf(watcher), (BOND - 2 * PRICE) / 10);
+    }
+
+    function test_AMakerWhoAsksAboutTheirOwnBrokenPromiseGetsNoBounty() public {
+        uint256 id = _make();
+        _close(id);
+        vm.roll(vm.getBlockNumber() + vault.SETTLE_DELAY_BLOCKS());
+        vm.prank(maker);
+        bytes32 requestId = vault.ask(id);
+        _answer(id, requestId, MAX_OUT + 1);
+        vault.payout(id);
+        uint256 left = BOND - PRICE;
+        assertEq(imd.balanceOf(maker), 100 ether - BOND, "a broken maker gets nothing back");
+        assertEq(imd.balanceOf(vault.BURN()), left, "with no stakers the whole remainder burns");
+        assertEq(imd.balanceOf(address(vault)), 0);
+    }
+
+    function test_AMakerWhoAsksAboutTheirOwnKeptPromiseStillGetsTheBond() public {
+        uint256 id = _make();
+        _close(id);
+        vm.roll(vm.getBlockNumber() + vault.SETTLE_DELAY_BLOCKS());
+        vm.prank(maker);
+        bytes32 requestId = vault.ask(id);
+        _answer(id, requestId, 0);
+        vault.payout(id);
+        assertEq(imd.balanceOf(maker), 100 ether - PRICE);
+    }
+
+    function test_AskRefusesAPriceAboveTheOneTheBondWasMadeUnder() public {
+        uint256 id = _make();
+        (uint256 maxPrice,,) = vault.terms(id);
+        assertEq(maxPrice, PRICE);
+        _close(id);
+        vm.roll(vm.getBlockNumber() + vault.SETTLE_DELAY_BLOCKS());
+
+        intake.setPrice(PRICE + 1);
+        vm.expectRevert(PinkyVault.InvalidPayment.selector);
+        vault.ask(id);
+
+        MockIntake greedy = new MockIntake(payee, BOND);
+        vm.prank(owner);
+        vault.setProtocol(address(greedy), ACTION);
+        vm.expectRevert(PinkyVault.InvalidPayment.selector);
+        vault.ask(id);
+        assertEq(imd.balanceOf(address(vault)), BOND);
+
+        intake.setPrice(PRICE - 1);
+        vm.prank(owner);
+        vault.setProtocol(address(intake), ACTION);
+        vault.ask(id);
+        assertEq(_bond(id), BOND - (PRICE - 1));
     }
 
     function test_RefundAfterThreeUnansweredAttempts() public {
@@ -469,9 +619,7 @@ contract PinkyVaultTest is Test {
         if (out <= maxOut) {
             assertEq(imd.balanceOf(maker), 100 ether - PRICE);
         } else {
-            assertEq(
-                imd.balanceOf(watcher) + imd.balanceOf(address(staking)) + imd.balanceOf(vault.BURN()), left
-            );
+            assertEq(imd.balanceOf(watcher) + imd.balanceOf(address(staking)) + imd.balanceOf(vault.BURN()), left);
         }
     }
 }

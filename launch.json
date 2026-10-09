@@ -32,7 +32,7 @@
   ],
   "pool": {
     "pairedCurrency": "0x5f7bb59365ce557c26dbcaa4ee9d39a4b95b7127",
-    "fee": 3000,
+    "fee": 12500,
     "tickSpacing": 60,
     "initialPrice": "79228162514264337593543950336"
   },

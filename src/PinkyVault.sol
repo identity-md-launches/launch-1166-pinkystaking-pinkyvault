@@ -49,6 +49,15 @@ contract PinkyVault is OracleAttestationConsumer, ReentrancyGuard {
         uint256 observedOut;
     }
 
+    /// @dev What a promise was bought under: the oracle price seen at `make`, which `ask` may not
+    /// exceed, and the smallest panel any of its `ask`s paid for, which the answer is checked
+    /// against rather than the owner's current settings.
+    struct Terms {
+        uint256 maxPrice;
+        uint16 panelSize;
+        uint16 quorum;
+    }
+
     error OnlyOwner();
     error InvalidConfiguration();
     error InvalidPromise();
@@ -103,6 +112,7 @@ contract PinkyVault is OracleAttestationConsumer, ReentrancyGuard {
     uint32 public validForSeconds;
     uint256 public count;
     mapping(uint256 => Promise) public promises;
+    mapping(uint256 => Terms) public terms;
     mapping(address => mapping(bytes32 => uint256)) public promiseIdFor;
 
     constructor(
@@ -156,6 +166,7 @@ contract PinkyVault is OracleAttestationConsumer, ReentrancyGuard {
         v.bond = bond;
         v.startBlock = uint64(_chainBlock());
         v.endTime = uint64(block.timestamp + duration);
+        terms[id].maxPrice = price;
         emit Made(id, msg.sender, token, maxOut, bond, v.startBlock, v.endTime);
     }
 
@@ -171,11 +182,13 @@ contract PinkyVault is OracleAttestationConsumer, ReentrancyGuard {
     }
 
     /// @notice Buys the oracle's answer for a closed promise out of its bond.
+    /// @dev Asking again after the timeout does not kill the earlier request: every request this
+    /// promise paid for stays answerable until a verdict lands, and the first answer wins. The
+    /// asker is whoever asked first, unless that was the maker, who earns no bounty.
     function ask(uint256 id) external nonReentrant returns (bytes32 requestId) {
         Promise storage v = _promise(id);
         if (v.status == Status.Asked) {
             if (block.timestamp < uint256(v.askedAt) + ANSWER_TIMEOUT) revert TooEarly();
-            delete promiseIdFor[v.intake][v.requestId];
         } else if (v.status != Status.Closed) {
             revert WrongStatus();
         }
@@ -183,20 +196,29 @@ contract PinkyVault is OracleAttestationConsumer, ReentrancyGuard {
         if (v.attempts >= MAX_ATTEMPTS) revert NoAttemptsLeft();
 
         IIntake intake_ = intake;
+        Terms storage t = terms[id];
         uint256 price = intake_.priceOf(action, address(imd));
-        if (price == 0 || price > v.bond) revert InvalidPayment();
+        if (price == 0 || price > v.bond || price > t.maxPrice) revert InvalidPayment();
 
         v.status = Status.Asked;
         v.attempts += 1;
         v.bond -= price;
         v.askedAt = uint64(block.timestamp);
-        v.asker = msg.sender;
+        if (v.asker == address(0) || v.asker == v.maker) v.asker = msg.sender;
         v.intake = address(intake_);
+        // An answer to any request this promise paid for counts, so the check uses the smallest
+        // panel any of them asked for.
+        if (t.panelSize == 0 || panelSize < t.panelSize) t.panelSize = panelSize;
+        if (t.quorum == 0 || quorum < t.quorum) t.quorum = quorum;
 
         uint256 balanceBefore = imd.balanceOf(address(this));
         imd.forceApprove(address(intake_), price);
         requestId = intake_.request(
-            action, _body(v), IIntake.Callback(address(this), this.onOracleResult.selector), address(imd), price
+            action,
+            _body(v, panelSize, quorum),
+            IIntake.Callback(address(this), this.onOracleResult.selector),
+            address(imd),
+            price
         );
         imd.forceApprove(address(intake_), 0);
         if (imd.balanceOf(address(this)) + price != balanceBefore) revert InvalidPayment();
@@ -217,9 +239,10 @@ contract PinkyVault is OracleAttestationConsumer, ReentrancyGuard {
         Promise storage v = promises[id];
         if (v.status != Status.Asked) revert WrongStatus();
         _verifyAttestation(a, signature);
+        Terms storage t = terms[id];
         if (
             a.chainId != block.chainid || a.fromBlock != v.startBlock || a.toBlock != v.endBlock
-                || a.panelSize < panelSize || a.quorum < quorum || a.quorum > a.panelSize
+                || a.panelSize < t.panelSize || a.quorum < t.quorum || a.quorum > a.panelSize || a.agreed < a.quorum
         ) revert InvalidAttestation();
         if (a.answer.length != 32) revert InvalidAttestation();
         uint256 out = decodeUint256(a);
@@ -246,7 +269,8 @@ contract PinkyVault is OracleAttestationConsumer, ReentrancyGuard {
             emit Paid(id, amount, 0, 0, 0);
             return;
         }
-        uint256 bounty = amount * BOUNTY_BPS / 10_000;
+        // The bounty pays a watcher. A maker who asked about their own broken promise gets none.
+        uint256 bounty = v.asker == v.maker ? 0 : amount * BOUNTY_BPS / 10_000;
         uint256 rest = amount - bounty;
         uint256 toStakers = rest / 2;
         if (toStakers == 0 || staking.totalStaked() == 0) {
@@ -296,10 +320,10 @@ contract PinkyVault is OracleAttestationConsumer, ReentrancyGuard {
 
     /// @notice The oracle body `ask` would send for this promise once it is closed.
     function bodyOf(uint256 id) external view returns (string memory) {
-        return string(_body(_promise(id)));
+        return string(_body(_promise(id), panelSize, quorum));
     }
 
-    function _body(Promise storage v) private view returns (bytes memory) {
+    function _body(Promise storage v, uint16 panelSize_, uint16 quorum_) private view returns (bytes memory) {
         return bytes(
             string.concat(
                 '{"v":1,"question":"What is the sum of the value argument of every Transfer(address indexed from, address indexed to, uint256 value) event emitted by the token contract ',
@@ -317,9 +341,9 @@ contract PinkyVault is OracleAttestationConsumer, ReentrancyGuard {
                 '\\",\\"event\\":\\"event Transfer(address indexed from, address indexed to, uint256 value)\\",\\"sumArg\\":\\"value\\",\\"abs\\":false,\\"filter\\":{\\"from\\":\\"',
                 Strings.toHexString(v.maker),
                 '\\"}} - write recipe exactly this, event text included."},"panelSize":',
-                Strings.toString(panelSize),
+                Strings.toString(panelSize_),
                 ',"quorum":',
-                Strings.toString(quorum),
+                Strings.toString(quorum_),
                 ',"toleranceBps":0,"validForSeconds":',
                 Strings.toString(validForSeconds),
                 "}"

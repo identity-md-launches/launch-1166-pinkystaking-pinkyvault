@@ -46,9 +46,11 @@ contract PinkyStaking is ReentrancyGuard {
         rewardToken = IERC20(rewardToken_);
     }
 
+    /// @dev While nobody is staked `lastUpdate` stays put, so the stream that passed with no one to
+    /// earn it is paid to whoever stakes next instead of staying in the contract forever.
     modifier updateReward(address account) {
         rewardPerTokenStored = rewardPerToken();
-        lastUpdate = lastTimeRewardApplicable();
+        if (totalStaked != 0) lastUpdate = lastTimeRewardApplicable();
         if (account != address(0)) {
             rewards[account] = earned(account);
             rewardPerTokenPaid[account] = rewardPerTokenStored;
