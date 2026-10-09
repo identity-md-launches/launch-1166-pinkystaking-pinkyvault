@@ -124,8 +124,10 @@ contract PinkyVaultEdgesTest is PinkyFixture {
         vault.make(address(token), MAX_OUT, 1 hours, 6 ether - 1);
         uint256 id = vault.make(address(token), MAX_OUT, 1 hours, 6 ether);
         vm.stopPrank();
-        (uint256 maxPrice,,) = vault.terms(id);
+        (uint256 maxPrice,,, address madeUnder, bytes32 madeFor) = vault.terms(id);
         assertEq(maxPrice, 2 ether);
+        assertEq(madeUnder, address(intake));
+        assertEq(madeFor, ACTION);
     }
 
     function test_MakeNeedsAnAllowanceAndABalance() public {
@@ -174,22 +176,24 @@ contract PinkyVaultEdgesTest is PinkyFixture {
         _make();
     }
 
-    function test_MakeUnderAZeroQuoteCanNeverBeAskedOnlyRefunded() public {
-        intake.setPrice(0);
+    function test_AQuoteThatDropsToZeroAfterMakeLeavesOnlyTheRefund() public {
         uint256 id = _make();
-        (uint256 maxPrice,,) = vault.terms(id);
-        assertEq(maxPrice, 0);
+        intake.setPrice(0);
         _close(id);
         vm.roll(vm.getBlockNumber() + vault.SETTLE_DELAY_BLOCKS());
         vm.expectRevert(PinkyVault.InvalidPayment.selector);
         vault.ask(id);
+        assertEq(uint8(_status(id)), uint8(PinkyVault.Status.Closed));
+        assertEq(_attempts(id), 0);
+        // A quote again, at the price the promise was made under, and the ask goes through.
         intake.setPrice(PRICE);
-        vm.expectRevert(PinkyVault.InvalidPayment.selector);
+        vm.prank(watcher);
         vault.ask(id);
+        assertEq(_bond(id), BOND - PRICE);
 
         vm.warp(vm.getBlockTimestamp() + vault.REFUND_GRACE());
         vault.refund(id);
-        assertEq(imd.balanceOf(maker), 100 ether);
+        assertEq(imd.balanceOf(maker), 100 ether - PRICE);
     }
 
     // ───────────────────────── close ─────────────────────────
@@ -343,6 +347,99 @@ contract PinkyVaultEdgesTest is PinkyFixture {
         assertEq(_bond(second), BOND);
     }
 
+    /// @dev The price room a promise has depends on which protocol `ask` runs under right now,
+    /// not on which one it was last asked under: away from the one it was made under it is capped,
+    /// back at it the bond pays whatever is quoted.
+    function test_ASwitchAwayAndBackLeavesThePromiseAtItsOwnProtocol() public {
+        uint256 id = _make();
+        _close(id);
+        vm.roll(vm.getBlockNumber() + vault.SETTLE_DELAY_BLOCKS());
+
+        StipendIntake other = new StipendIntake(payee, PRICE + 1);
+        vm.prank(owner);
+        vault.setProtocol(address(other), ACTION);
+        vm.expectRevert(PinkyVault.InvalidPayment.selector);
+        vault.ask(id);
+        other.setPrice(PRICE);
+        vm.prank(watcher);
+        bytes32 first = vault.ask(id);
+        assertEq(vault.promiseIdFor(address(other), first), id);
+        (,,, address madeUnder, bytes32 madeFor) = vault.terms(id);
+        assertEq(madeUnder, address(intake), "an ask elsewhere does not move the promise's protocol");
+        assertEq(madeFor, ACTION);
+
+        // Back at the Intake it was made under, which now charges four times more: the bond pays.
+        vm.prank(owner);
+        vault.setProtocol(address(intake), ACTION);
+        intake.setPrice(2 ether);
+        vm.warp(vm.getBlockTimestamp() + vault.ANSWER_TIMEOUT());
+        vm.prank(watcher);
+        bytes32 second = vault.ask(id);
+        assertEq(_bond(id), BOND - PRICE - 2 ether);
+        assertEq(vault.promiseIdFor(address(intake), second), id);
+        assertEq(imd.balanceOf(payee), PRICE + 2 ether);
+
+        // Away again, the cap is the price it was made under, not the one it just paid.
+        vm.prank(owner);
+        vault.setProtocol(address(other), ACTION);
+        other.setPrice(PRICE + 1);
+        vm.warp(vm.getBlockTimestamp() + vault.ANSWER_TIMEOUT());
+        vm.expectRevert(PinkyVault.InvalidPayment.selector);
+        vault.ask(id);
+
+        _answer(id, second, 0);
+        vault.payout(id);
+        assertEq(imd.balanceOf(maker), 100 ether - PRICE - 2 ether);
+    }
+
+    /// @dev The trade-off the review chose: the Intake a promise was made under is trusted with its
+    /// price, so a rise up to what is left of the bond is paid, and a kept maker can get nothing
+    /// back. Pinned so that a change to the rule is noticed; it is not approval of a price rise.
+    function test_APriceRiseToTheWholeBondLeavesAKeptMakerNothing() public {
+        uint256 id = _make();
+        _close(id);
+        vm.roll(vm.getBlockNumber() + vault.SETTLE_DELAY_BLOCKS());
+        intake.setPrice(BOND);
+        vm.prank(watcher);
+        bytes32 requestId = vault.ask(id);
+        assertEq(_bond(id), 0);
+        assertEq(imd.balanceOf(payee), BOND);
+
+        _answer(id, requestId, 0);
+        assertEq(uint8(_status(id)), uint8(PinkyVault.Status.Kept));
+        vm.expectEmit(true, false, false, true, address(vault));
+        emit PinkyVault.Paid(id, 0, 0, 0, 0);
+        vault.payout(id);
+        assertEq(imd.balanceOf(maker), 100 ether - BOND);
+        assertEq(imd.balanceOf(address(vault)), 0);
+    }
+
+    function test_ASecondAskAfterAPriceRiseIsHeldToWhatIsLeft() public {
+        uint256 id = _make();
+        _close(id);
+        _ask(id);
+        uint256 left = BOND - PRICE;
+        vm.warp(vm.getBlockTimestamp() + vault.ANSWER_TIMEOUT());
+        intake.setPrice(left + 1);
+        vm.expectRevert(PinkyVault.InvalidPayment.selector);
+        vault.ask(id);
+        intake.setPrice(left);
+        vm.prank(watcher);
+        vault.ask(id);
+        assertEq(_bond(id), 0);
+        assertEq(_attempts(id), 2);
+        // The third attempt is open but there is nothing to pay it with.
+        vm.warp(vm.getBlockTimestamp() + vault.ANSWER_TIMEOUT());
+        intake.setPrice(1);
+        vm.expectRevert(PinkyVault.InvalidPayment.selector);
+        vault.ask(id);
+        vm.warp(vm.getBlockTimestamp() + vault.REFUND_GRACE());
+        vm.expectEmit(true, false, false, true, address(vault));
+        emit PinkyVault.Refunded(id, 0);
+        vault.refund(id);
+        assertEq(imd.balanceOf(maker), 100 ether - BOND);
+    }
+
     function test_AskEmitsAsked() public {
         uint256 id = _make();
         _close(id);
@@ -365,7 +462,7 @@ contract PinkyVaultEdgesTest is PinkyFixture {
         assertEq(vm.parseJsonUint(body, ".quorum"), 100);
         assertEq(vm.parseJsonUint(body, ".validForSeconds"), 60);
         assertLe(bytes(body).length, 16 * 1024);
-        (, uint16 askedPanel, uint16 askedQuorum) = vault.terms(id);
+        (, uint16 askedPanel, uint16 askedQuorum,,) = vault.terms(id);
         assertEq(askedPanel, 100);
         assertEq(askedQuorum, 100);
     }

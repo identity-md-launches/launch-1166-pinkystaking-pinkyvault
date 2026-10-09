@@ -23,6 +23,8 @@ contract StakingHandler is Test {
     uint256 public notifies;
     /// @dev Calls that ran `updateReward`, each of which may lose a little to rounding.
     uint256 public updates;
+    /// @dev What the stream still held the moment the last staker left, which a pause must keep.
+    uint256 public pausedOwed;
     mapping(address => uint256) public minted;
     mapping(address => uint256) public claimed;
 
@@ -45,8 +47,16 @@ contract StakingHandler is Test {
         amount = bound(amount, 1, room);
         pinky.mint(actor, amount);
         minted[actor] += amount;
+        bool resuming = staking.totalStaked() == 0;
+        uint256 remainingBefore = staking.periodFinish() - staking.lastUpdate();
+        uint256 earnedBefore = staking.earned(actor);
         vm.prank(actor);
         staking.stake(amount);
+        if (resuming) {
+            assertEq(staking.earned(actor), earnedBefore, "a pause credits nothing to the staker who ends it");
+            assertEq(staking.periodFinish() - staking.lastUpdate(), remainingBefore, "a resume keeps the time left");
+            if (remainingBefore != 0) assertEq(staking.lastUpdate(), block.timestamp, "and starts it now");
+        }
         updates += 1;
     }
 
@@ -57,6 +67,9 @@ contract StakingHandler is Test {
         amount = bound(amount, 1, held);
         vm.prank(actor);
         staking.unstake(amount);
+        if (staking.totalStaked() == 0) {
+            pausedOwed = staking.rewardRate() * (staking.periodFinish() - staking.lastUpdate());
+        }
         updates += 1;
     }
 
@@ -79,8 +92,14 @@ contract StakingHandler is Test {
         address from = notifiers[who % notifiers.length];
         amount = bound(amount, staking.MIN_REWARD(), 1_000 ether);
         imd.mint(from, amount);
+        uint256 rateBefore = staking.rewardRate();
+        uint256 finishBefore = staking.periodFinish();
+        bool running = block.timestamp < finishBefore;
         vm.prank(from);
         staking.notify(amount);
+        if (running) assertGe(staking.rewardRate(), rateBefore, "a notify never lowers a running rate");
+        assertGe(staking.periodFinish(), finishBefore, "a notify never moves the end earlier");
+        assertLe(staking.periodFinish(), block.timestamp + DURATION, "nor past seven days");
         totalNotified += amount;
         notifies += 1;
         updates += 1;
@@ -158,6 +177,14 @@ contract PinkyStakingInvariantTest is Test {
         assertLe(accounted, handler.totalNotified(), "accounted for more than was notified");
         uint256 dust = handler.notifies() * DURATION + handler.updates() * 4_000 + 10;
         assertLe(handler.totalNotified() - accounted, dust, "IMD stranded beyond rounding");
+    }
+
+    /// @notice While nobody is staked the stream is frozen: what it held when the last staker left
+    /// is exactly what it holds now, whatever was called and however much time passed.
+    function invariant_APausedStreamIsFrozen() public view {
+        if (staking.totalStaked() != 0) return;
+        assertEq(staking.rewardRate() * (staking.periodFinish() - staking.lastUpdate()), handler.pausedOwed());
+        assertEq(staking.rewardPerToken(), staking.rewardPerTokenStored(), "nothing accrues while paused");
     }
 
     /// @notice The clock never runs backwards, so the rate arithmetic cannot underflow.

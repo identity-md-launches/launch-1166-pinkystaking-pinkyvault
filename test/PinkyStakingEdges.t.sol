@@ -135,16 +135,76 @@ contract PinkyStakingEdgesTest is Test {
         assertApproxEqAbs(staking.earned(bob), 2 ether, 1e7);
     }
 
-    function test_ANotifyMidStreamRestretchesWhatIsLeft() public {
+    /// @dev Changed with the review fix: a small addition keeps the stream's rate and ends sooner
+    /// instead of spreading what is left over a fresh seven days.
+    function test_ASmallNotifyMidStreamKeepsTheRateAndEndsSooner() public {
         _stake(alice, 1 ether);
         staking.notify(7 ether);
+        uint256 rate = staking.rewardRate();
         vm.warp(vm.getBlockTimestamp() + 3 days);
-        uint256 remaining = (staking.periodFinish() - vm.getBlockTimestamp()) * staking.rewardRate();
+        uint256 remaining = (staking.periodFinish() - vm.getBlockTimestamp()) * rate;
+        vm.expectEmit(true, false, false, true, address(staking));
+        emit PinkyStaking.Notified(address(this), 1 ether, vm.getBlockTimestamp() + 5 days);
         staking.notify(1 ether);
-        assertEq(staking.rewardRate(), (1 ether + remaining) / DURATION);
+        // Four days were left at one IMD a day; one more IMD is one more day at that rate.
+        assertEq(staking.rewardRate(), (1 ether + remaining) / ((1 ether + remaining) / rate));
+        assertGe(staking.rewardRate(), rate);
+        assertEq(staking.periodFinish(), vm.getBlockTimestamp() + 5 days);
+        vm.warp(vm.getBlockTimestamp() + 5 days);
+        assertApproxEqAbs(staking.earned(alice), 8 ether, 1e7);
+        vm.warp(vm.getBlockTimestamp() + 2 days);
+        assertApproxEqAbs(staking.earned(alice), 8 ether, 1e7, "nothing more after the shortened end");
+    }
+
+    /// @dev The exact boundary of the rate floor: an addition that makes what is left plus itself
+    /// stream over seven days at exactly the current rate restretches to seven days.
+    function test_ANotifyThatExactlyMatchesTheRateRestretchesToSevenDays() public {
+        _stake(alice, 1 ether);
+        staking.notify(7 ether);
+        uint256 rate = staking.rewardRate();
+        vm.warp(vm.getBlockTimestamp() + 3 days);
+        uint256 leftover = (staking.periodFinish() - vm.getBlockTimestamp()) * rate;
+        uint256 exact = rate * DURATION - leftover;
+        staking.notify(exact);
+        assertEq(staking.rewardRate(), rate);
         assertEq(staking.periodFinish(), vm.getBlockTimestamp() + DURATION);
         vm.warp(vm.getBlockTimestamp() + DURATION);
-        assertApproxEqAbs(staking.earned(alice), 8 ether, 1e7);
+        assertApproxEqAbs(staking.earned(alice), 7 ether + exact, 1e7);
+    }
+
+    /// @dev One wei under that boundary, and the stream keeps its rate and ends a second early.
+    function test_OneWeiUnderTheBoundaryKeepsTheRateAndEndsASecondEarly() public {
+        _stake(alice, 1 ether);
+        staking.notify(7 ether);
+        uint256 rate = staking.rewardRate();
+        vm.warp(vm.getBlockTimestamp() + 3 days);
+        uint256 leftover = (staking.periodFinish() - vm.getBlockTimestamp()) * rate;
+        uint256 under = rate * DURATION - leftover - 1;
+        staking.notify(under);
+        assertGe(staking.rewardRate(), rate, "the rate never drops");
+        assertEq(staking.periodFinish(), vm.getBlockTimestamp() + DURATION - 1);
+        uint256 streams = staking.rewardRate() * (DURATION - 1);
+        assertLe(streams, under + leftover);
+        assertGe(streams + DURATION, under + leftover, "only truncation dust is lost");
+    }
+
+    /// @dev At the tail of a fast stream a floor-sized addition is paid out in seconds, at the
+    /// stream's rate: the rule's sharp edge, which moves no value it should not.
+    function test_AFloorNotifyAtTheTailOfAFastStreamIsPaidInSeconds() public {
+        imd.mint(address(this), 1 ether);
+        _stake(alice, 1 ether);
+        staking.notify(1_000_000 ether);
+        uint256 rate = staking.rewardRate();
+        vm.warp(staking.periodFinish() - 1);
+        uint256 leftover = rate;
+        uint256 floor_ = staking.MIN_REWARD();
+        staking.notify(floor_);
+        uint256 period = (floor_ + leftover) / rate;
+        assertEq(staking.periodFinish(), vm.getBlockTimestamp() + period);
+        assertLe(period, 2);
+        assertGe(staking.rewardRate(), rate);
+        vm.warp(vm.getBlockTimestamp() + period);
+        assertApproxEqAbs(staking.earned(alice), 1_000_000 ether + floor_, 1e9);
     }
 
     function test_AFlashStakeInTheSameBlockEarnsNothing() public {
@@ -161,24 +221,65 @@ contract PinkyStakingEdgesTest is Test {
         assertApproxEqAbs(staking.earned(alice), 3 ether, 1e7);
     }
 
-    /// @dev The documented rule: stream time that passes with nobody staked is credited to the
-    /// next staker. That includes a one-wei staker in the same transaction, which is the price
-    /// of not stranding the IMD; it is noted as a finding, not a defect, for the reviewer.
-    function test_TheIdleStreamGoesToTheNextStakerAtOnce() public {
+    /// @dev Changed with the review fix: the stream pauses while nobody is staked. The first
+    /// staker back, even with one wei, is credited nothing for the pause and is paid at the
+    /// stream's rate for the time it had left.
+    function test_TheStreamPausesWhileNobodyIsStakedAndResumesForTheNextStaker() public {
         _stake(alice, 1 ether);
         staking.notify(7 ether);
+        uint256 finish = staking.periodFinish();
+        uint256 rate = staking.rewardRate();
         _unstake(alice, 1 ether);
         vm.warp(vm.getBlockTimestamp() + 2 days);
+        assertEq(staking.periodFinish(), finish, "paused: the clock has not moved");
+        assertEq(staking.rewardPerToken(), 0);
+
         pinky.mint(carol, 1);
         vm.startPrank(carol);
         pinky.approve(address(staking), 1);
         staking.stake(1);
-        assertApproxEqAbs(staking.earned(carol), 2 ether, 1e7, "two idle days land on the first staker back");
+        assertEq(staking.earned(carol), 0, "the two idle days are not credited to the first staker back");
+        vm.expectRevert(PinkyStaking.ZeroAmount.selector);
         staking.claim();
-        staking.unstake(1);
         vm.stopPrank();
-        assertApproxEqAbs(imd.balanceOf(carol), 2 ether, 1e7);
+        assertEq(staking.periodFinish(), vm.getBlockTimestamp() + DURATION, "the whole week it had left");
+        assertEq(staking.lastUpdate(), vm.getBlockTimestamp());
+        assertEq(staking.rewardRate(), rate);
+
+        vm.warp(vm.getBlockTimestamp() + DURATION);
+        assertApproxEqAbs(staking.earned(carol), 7 ether, 1e7);
         assertEq(staking.earned(alice), 0);
+    }
+
+    /// @dev A stream that ran out while people were staked has nothing to resume: a later stake
+    /// after everyone left starts no new stream and earns nothing.
+    function test_AStreamThatEndedWithStakersDoesNotResume() public {
+        _stake(alice, 1 ether);
+        staking.notify(7 ether);
+        vm.warp(vm.getBlockTimestamp() + 8 days);
+        _unstake(alice, 1 ether);
+        uint256 finish = staking.periodFinish();
+        assertEq(staking.lastUpdate(), finish);
+        vm.warp(vm.getBlockTimestamp() + 3 days);
+        _stake(bob, 1 ether);
+        assertEq(staking.periodFinish(), finish, "nothing was left to resume");
+        vm.warp(vm.getBlockTimestamp() + DURATION);
+        assertEq(staking.earned(bob), 0);
+        assertApproxEqAbs(staking.earned(alice), 7 ether, 1e7);
+    }
+
+    function test_APartialUnstakeDoesNotPauseTheStream() public {
+        _stake(alice, 2 ether);
+        staking.notify(7 ether);
+        uint256 finish = staking.periodFinish();
+        vm.warp(vm.getBlockTimestamp() + 1 days);
+        _unstake(alice, 2 ether - 1);
+        vm.warp(vm.getBlockTimestamp() + 1 days);
+        _stake(bob, 1 ether);
+        assertEq(staking.periodFinish(), finish, "one wei staked keeps the clock running");
+        assertApproxEqAbs(staking.earned(alice), 2 ether, 1e7);
+        vm.warp(finish);
+        assertApproxEqAbs(staking.earned(alice) + staking.earned(bob), 7 ether, 1e7);
     }
 
     function test_RewardsSurviveAFullUnstake() public {
@@ -276,6 +377,52 @@ contract PinkyStakingEdgesTest is Test {
         assertGe(ea + eb + (a + b) / 1e18 + 2, streamed, "the stream is not lost");
         // Pro rata within the same rounding.
         assertApproxEqAbs(ea * b, eb * a, (a + b) * (a + b) / 1e18 + a + b);
+    }
+
+    /// forge-config: default.fuzz.runs = 1000
+    function testFuzz_ANotifyNeverSlowsOrShortensTheStream(uint256 first, uint256 elapsed, uint256 second) public {
+        first = bound(first, staking.MIN_REWARD(), 1_000 ether);
+        second = bound(second, staking.MIN_REWARD(), 1_000 ether);
+        elapsed = bound(elapsed, 0, DURATION + 1 days);
+        _stake(alice, 1 ether);
+        staking.notify(first);
+        vm.warp(vm.getBlockTimestamp() + elapsed);
+        uint256 now_ = vm.getBlockTimestamp();
+        uint256 rate = staking.rewardRate();
+        uint256 finish = staking.periodFinish();
+        uint256 leftover = now_ < finish ? (finish - now_) * rate : 0;
+
+        staking.notify(second);
+        if (leftover != 0) assertGe(staking.rewardRate(), rate, "a notify never lowers a running rate");
+        assertGe(staking.periodFinish(), finish, "nor moves the end earlier");
+        assertLe(staking.periodFinish(), now_ + DURATION, "nor past seven days");
+        assertGt(staking.periodFinish(), now_);
+        uint256 streams = staking.rewardRate() * (staking.periodFinish() - now_);
+        assertLe(streams, second + leftover, "the stream never promises more than it holds");
+        assertGe(streams + DURATION, second + leftover, "only truncation dust is lost");
+    }
+
+    /// forge-config: default.fuzz.runs = 500
+    function testFuzz_APauseOfAnyLengthCreditsNothingToTheStakerWhoResumes(uint256 reward, uint256 run, uint256 gap)
+        public
+    {
+        reward = bound(reward, staking.MIN_REWARD(), 1_000 ether);
+        run = bound(run, 0, DURATION);
+        gap = bound(gap, 1, 60 days);
+        _stake(alice, 1 ether);
+        staking.notify(reward);
+        vm.warp(vm.getBlockTimestamp() + run);
+        _unstake(alice, 1 ether);
+        uint256 owedAlice = staking.earned(alice);
+        uint256 remaining = staking.periodFinish() - staking.lastUpdate();
+        vm.warp(vm.getBlockTimestamp() + gap);
+        _stake(bob, 1 ether);
+        assertEq(staking.earned(bob), 0);
+        assertEq(staking.periodFinish() - staking.lastUpdate(), remaining, "the time left is preserved");
+        if (remaining != 0) assertEq(staking.lastUpdate(), vm.getBlockTimestamp(), "and it starts now");
+        vm.warp(vm.getBlockTimestamp() + remaining);
+        assertLe(owedAlice + staking.earned(bob), reward);
+        assertGe(owedAlice + staking.earned(bob) + DURATION + 2, reward, "nothing is stranded by the pause");
     }
 
     /// forge-config: default.fuzz.runs = 500

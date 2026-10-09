@@ -19,6 +19,8 @@ contract PinkyHandler is Test {
     MockERC20 public pinky;
     MockERC20 public token;
     MockIntake public intake;
+    /// @dev A second Intake the owner may switch to, so the cap on another protocol is exercised.
+    MockIntake public other;
 
     address[3] makers = [address(0xA1), address(0xA2), address(0xA3)];
     address staker = address(0x57A4E);
@@ -36,8 +38,10 @@ contract PinkyHandler is Test {
     mapping(uint256 => PinkyVault.Status) public lastStatus;
     mapping(uint256 => bool) public lastPaid;
     mapping(uint256 => uint8) public lastAttempts;
-    /// @dev What each promise was made with.
+    /// @dev What each promise was made with, and the oracle fees it has paid since, at whatever
+    /// price each ask found.
     mapping(uint256 => uint256) public bondAt;
+    mapping(uint256 => uint256) public feesPaid;
 
     /// @dev Called at the end of every action: a promise only ever moves forward, one step at a
     /// time, and a settled one never reopens.
@@ -85,6 +89,7 @@ contract PinkyHandler is Test {
         MockIntake intake_
     ) {
         (vault, staking, imd, pinky, token, intake) = (vault_, staking_, imd_, pinky_, token_, intake_);
+        other = new MockIntake(address(0xFEE), PRICE);
         pinky.mint(staker, 1_000 ether);
         vm.prank(staker);
         pinky.approve(address(staking), type(uint256).max);
@@ -99,17 +104,47 @@ contract PinkyHandler is Test {
         (,,,,,,,,,, s,,,,,) = vault.promises(id);
     }
 
+    function _current() internal view returns (MockIntake) {
+        return MockIntake(address(vault.intake()));
+    }
+
     function make(uint256 who, uint256 bond, uint256 maxOut, uint256 duration) external steps {
         address maker = makers[who % 3];
-        bond = bound(bond, 5 ether, 50 ether);
+        uint256 price = _current().price();
+        uint256 floor_ = 3 * price > 5 ether ? 3 * price : 5 ether;
+        bond = bound(bond, floor_, 50 ether);
         duration = bound(duration, 10 minutes, 30 days);
         imd.mint(maker, bond);
         vm.startPrank(maker);
         imd.approve(address(vault), bond);
+        if (price == 0) {
+            vm.expectRevert(PinkyVault.InvalidPayment.selector);
+            vault.make(address(token), maxOut, duration, bond);
+            vm.stopPrank();
+            return;
+        }
         uint256 id = vault.make(address(token), maxOut, duration, bond);
         vm.stopPrank();
         deposited += bond;
         bondAt[id] = bond;
+        (uint256 maxPrice,,, address madeUnder,) = vault.terms(id);
+        assertEq(maxPrice, price, "the price seen at make is the cap elsewhere");
+        assertEq(madeUnder, address(_current()));
+    }
+
+    /// @dev The Intake moves its price, sometimes to nothing: `make` refuses, `ask` pays it at the
+    /// promise's own protocol and is capped at another.
+    function setPrice(bool which, uint256 price) external steps {
+        price = bound(price, 0, 5 ether);
+        if (price < 0.05 ether) price = 0;
+        (which ? other : intake).setPrice(price);
+    }
+
+    function switchProtocol(bool toOther) external steps {
+        address owner = vault.owner();
+        bytes32 action = vault.action();
+        vm.prank(owner);
+        vault.setProtocol(address(toOther ? other : intake), action);
     }
 
     function pass(uint256 secs, uint256 blocks) external steps {
@@ -157,10 +192,27 @@ contract PinkyHandler is Test {
             vm.roll(endBlock + vault.SETTLE_DELAY_BLOCKS());
         }
         (,,,,,,,,,,,, address askerBefore,,,) = vault.promises(id);
-        (address maker,,,,,,,,,,,,,,,) = vault.promises(id);
+        (address maker,,, uint256 bond,,,,,,,,,,,,) = vault.promises(id);
+
+        // The price rules, probed rather than skipped: a zero quote, a price above what is left of
+        // the bond, or a price above the one the promise was made under at another protocol, are
+        // refused and move nothing.
+        MockIntake cur = _current();
+        uint256 price = cur.price();
+        (uint256 maxPrice,,, address madeUnder,) = vault.terms(id);
+        bool same = address(cur) == madeUnder;
+        if (price == 0 || price > bond || (!same && price > maxPrice)) {
+            uint256 held = imd.balanceOf(address(vault));
+            vm.prank(who);
+            vm.expectRevert(PinkyVault.InvalidPayment.selector);
+            vault.ask(id);
+            assertEq(imd.balanceOf(address(vault)), held);
+            return;
+        }
         vm.prank(who);
         vault.ask(id);
-        toIntake += PRICE;
+        toIntake += price;
+        feesPaid[id] += price;
         (,,,,,,,,,,,, address askerAfter,,,) = vault.promises(id);
         if (askerBefore == address(0) || askerBefore == maker) {
             assertEq(askerAfter, who, "the first asker, or the first watcher after a maker, is recorded");
@@ -172,7 +224,7 @@ contract PinkyHandler is Test {
     function answer(uint256 seed, uint256 out) external steps {
         uint256 id = _pick(seed);
         if (id == 0 || _status(id) != PinkyVault.Status.Asked) return;
-        (,,,, uint64 startBlock, uint64 endBlock,,,,,,,,, bytes32 requestId,) = vault.promises(id);
+        (,,,, uint64 startBlock, uint64 endBlock,,,,,,,, address askedIntake, bytes32 requestId,) = vault.promises(id);
         OracleAttestation.Attestation memory a;
         a.requestId = bytes32(bytes16(keccak256(abi.encode(++nonce))));
         a.chainId = block.chainid;
@@ -186,7 +238,7 @@ contract PinkyHandler is Test {
         a.issuedAt = uint64(vm.getBlockTimestamp());
         a.expiresAt = uint64(vm.getBlockTimestamp() + 86_400);
         (uint8 v, bytes32 r, bytes32 s) = vm.sign(SIGNER_PK, vault.attestationDigest(a));
-        intake.complete(requestId, a, abi.encodePacked(r, s, v));
+        MockIntake(askedIntake).complete(requestId, a, abi.encodePacked(r, s, v));
         verdicts += 1;
     }
 
@@ -291,15 +343,16 @@ contract PinkyInvariantTest is Test {
         assertEq(imd.allowance(address(vault), address(staking)), 0);
     }
 
-    /// @notice Until it is settled, a bond is exactly the deposit less one oracle fee per ask, and
-    /// no promise is asked more than three times.
+    /// @notice Until it is settled, a bond is exactly the deposit less the oracle fee each ask paid
+    /// at the price it found, and no promise is asked more than three times.
     function invariant_BondIsTheDepositLessTheFeesPaid() public view {
         for (uint256 id = 1; id <= vault.count(); ++id) {
             (,,, uint256 bond,,,,,, uint8 attempts, PinkyVault.Status status, bool paid,,,,) = vault.promises(id);
             assertLe(attempts, vault.MAX_ATTEMPTS());
             if (!paid && status != PinkyVault.Status.Refunded) {
-                assertEq(bond, handler.bondAt(id) - attempts * 0.5 ether);
+                assertEq(bond, handler.bondAt(id) - handler.feesPaid(id));
             }
+            assertLe(handler.feesPaid(id), handler.bondAt(id), "fees never exceed the deposit");
             if (status == PinkyVault.Status.Active || status == PinkyVault.Status.Closed) assertEq(attempts, 0);
             if (
                 status == PinkyVault.Status.Asked || status == PinkyVault.Status.Kept
