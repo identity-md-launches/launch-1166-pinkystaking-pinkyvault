@@ -97,18 +97,101 @@ contract PinkyStakingTest is Test {
         assertLt(imd.balanceOf(address(staking)), 1e6, "only truncation dust stays behind");
     }
 
+    /// @dev Changed with the review fix: the stream pauses while nobody is staked, so the staker
+    /// who comes back is paid what was left over the time that was left, not all at once.
     function test_AGapInTheMiddleOfTheStreamIsNotLostEither() public {
         _stake(alice, 1 ether);
         staking.notify(7 ether);
+        uint256 finish = staking.periodFinish();
         vm.warp(vm.getBlockTimestamp() + 1 days);
         _unstake(alice, 1 ether);
         assertApproxEqAbs(staking.earned(alice), 1 ether, 1e7);
 
         vm.warp(vm.getBlockTimestamp() + 2 days);
         _stake(bob, 1 ether);
+        assertEq(staking.periodFinish(), finish + 2 days, "the pause moves the end of the stream back");
         vm.warp(vm.getBlockTimestamp() + 4 days);
-        assertApproxEqAbs(staking.earned(bob), 6 ether, 1e7, "the two idle days go to the staker who came back");
+        assertApproxEqAbs(staking.earned(bob), 4 ether, 1e7, "the stream resumes at its rate");
+        vm.warp(vm.getBlockTimestamp() + 2 days);
+        assertApproxEqAbs(staking.earned(bob), 6 ether, 1e7, "and the six days that were left are paid");
         assertApproxEqAbs(staking.earned(alice) + staking.earned(bob), 7 ether, 1e7);
+    }
+
+    /// @dev Review finding: a 1 wei stake used to collect every idle second's reward at once.
+    function test_AFlashStakeDuringAPauseEarnsNothing() public {
+        _stake(alice, 1 ether);
+        staking.notify(7 ether);
+        vm.warp(vm.getBlockTimestamp() + 1 days);
+        _unstake(alice, 1 ether);
+        vm.warp(vm.getBlockTimestamp() + 6 days);
+
+        address flash = makeAddr("flash");
+        pinky.mint(flash, 1);
+        vm.startPrank(flash);
+        pinky.approve(address(staking), 1);
+        staking.stake(1);
+        assertEq(staking.earned(flash), 0);
+        vm.expectRevert(PinkyStaking.ZeroAmount.selector);
+        staking.claim();
+        staking.unstake(1);
+        vm.stopPrank();
+        assertEq(imd.balanceOf(flash), 0, "a flash stake collects nothing");
+
+        vm.warp(vm.getBlockTimestamp() + 1);
+        _stake(bob, 100 ether);
+        vm.warp(vm.getBlockTimestamp() + 6 days);
+        assertApproxEqAbs(staking.earned(bob), 6 ether, 1e7, "the staker who stays is paid the rest");
+    }
+
+    function test_AStreamThatEndedWhilePausedResumesInFull() public {
+        _stake(alice, 1 ether);
+        staking.notify(7 ether);
+        _unstake(alice, 1 ether);
+        vm.warp(vm.getBlockTimestamp() + 30 days);
+        _stake(bob, 1 ether);
+        assertEq(staking.periodFinish(), vm.getBlockTimestamp() + 7 days);
+        vm.warp(vm.getBlockTimestamp() + 3 days);
+        assertApproxEqAbs(staking.earned(bob), 3 ether, 1e7);
+        _unstake(bob, 1 ether);
+        vm.warp(vm.getBlockTimestamp() + 10 days);
+        _stake(bob, 1 ether);
+        vm.warp(vm.getBlockTimestamp() + 4 days);
+        assertApproxEqAbs(staking.earned(bob), 7 ether, 1e7);
+        assertEq(staking.periodFinish(), staking.lastUpdate() + 4 days);
+    }
+
+    /// @dev Review finding: a dust `notify` every day used to restretch what was left over a fresh
+    /// seven days, cutting what stakers received in the advertised week by about a third.
+    function test_ADustNotifyDoesNotSlowTheStream() public {
+        _stake(alice, 100 ether);
+        staking.notify(22 ether);
+        uint256 rate = staking.rewardRate();
+        address griefer = makeAddr("griefer");
+        imd.mint(griefer, 1 ether);
+        vm.prank(griefer);
+        imd.approve(address(staking), type(uint256).max);
+        for (uint256 day; day < 7; ++day) {
+            vm.warp(vm.getBlockTimestamp() + 1 days);
+            vm.prank(griefer);
+            staking.notify(staking.MIN_REWARD());
+            assertGe(staking.rewardRate(), rate, "the rate never drops");
+            assertLt(staking.rewardRate() - rate, rate / 1_000, "nor does a dust notify raise it by more than rounding");
+        }
+        assertGe(staking.earned(alice) + 1e9, 22 ether, "the week's stream is paid in the week");
+        assertLe(staking.earned(alice), 22.07 ether);
+        vm.warp(vm.getBlockTimestamp() + 1 days);
+        assertApproxEqAbs(staking.earned(alice), 22.07 ether, 1e9, "the dust is paid right after");
+    }
+
+    function test_ALargerNotifyStillRaisesTheRateOverSevenDays() public {
+        _stake(alice, 1 ether);
+        staking.notify(7 ether);
+        vm.warp(vm.getBlockTimestamp() + 4 days);
+        staking.notify(11 ether);
+        assertEq(staking.periodFinish(), vm.getBlockTimestamp() + 7 days);
+        assertApproxEqAbs(staking.rewardRate(), uint256(14 ether) / 7 days, 1);
+        vm.warp(vm.getBlockTimestamp() + 7 days);
+        assertApproxEqAbs(staking.earned(alice), 18 ether, 1e7);
     }
 
     function test_ANotifyAfterAGapStillAccountsForEverything() public {

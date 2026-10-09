@@ -347,7 +347,7 @@ contract PinkyVaultTest is Test {
         uint256 id = _make();
         _close(id);
         bytes32 requestId = _ask(id);
-        (, uint16 askedPanel, uint16 askedQuorum) = vault.terms(id);
+        (, uint16 askedPanel, uint16 askedQuorum,,) = vault.terms(id);
         assertEq(askedPanel, 5);
         assertEq(askedQuorum, 4);
         assertEq(vm.parseJsonUint(string(intake.bodyOf(requestId)), ".panelSize"), 5);
@@ -367,7 +367,7 @@ contract PinkyVaultTest is Test {
         vm.warp(vm.getBlockTimestamp() + 1 days);
         bytes32 second = _ask(id);
         assertEq(vm.parseJsonUint(string(intake.bodyOf(second)), ".panelSize"), 9);
-        (, uint16 askedPanel, uint16 askedQuorum) = vault.terms(id);
+        (, uint16 askedPanel, uint16 askedQuorum,,) = vault.terms(id);
         assertEq(askedPanel, 5);
         assertEq(askedQuorum, 4);
         _answer(id, first, 0);
@@ -506,16 +506,16 @@ contract PinkyVaultTest is Test {
         assertEq(imd.balanceOf(maker), 100 ether - PRICE);
     }
 
-    function test_AskRefusesAPriceAboveTheOneTheBondWasMadeUnder() public {
+    /// @dev Audit finding: the owner could point `ask` at an Intake whose price equals a bond.
+    /// Another Intake, or another action, is held to the price the promise was made under.
+    function test_AskRefusesAPriceAboveTheOneTheBondWasMadeUnderAtAnotherProtocol() public {
         uint256 id = _make();
-        (uint256 maxPrice,,) = vault.terms(id);
+        (uint256 maxPrice,,, address madeUnder, bytes32 madeFor) = vault.terms(id);
         assertEq(maxPrice, PRICE);
+        assertEq(madeUnder, address(intake));
+        assertEq(madeFor, ACTION);
         _close(id);
         vm.roll(vm.getBlockNumber() + vault.SETTLE_DELAY_BLOCKS());
-
-        intake.setPrice(PRICE + 1);
-        vm.expectRevert(PinkyVault.InvalidPayment.selector);
-        vault.ask(id);
 
         MockIntake greedy = new MockIntake(payee, BOND);
         vm.prank(owner);
@@ -524,11 +524,75 @@ contract PinkyVaultTest is Test {
         vault.ask(id);
         assertEq(imd.balanceOf(address(vault)), BOND);
 
-        intake.setPrice(PRICE - 1);
+        // The same Intake selling another action is another protocol too.
+        intake.setPrice(PRICE + 1);
         vm.prank(owner);
-        vault.setProtocol(address(intake), ACTION);
+        vault.setProtocol(address(intake), bytes32("oracle.request@oracle-2"));
+        vm.expectRevert(PinkyVault.InvalidPayment.selector);
+        vault.ask(id);
+
+        // At or under the price the promise was made under, another protocol is fine.
+        intake.setPrice(PRICE - 1);
         vault.ask(id);
         assertEq(_bond(id), BOND - (PRICE - 1));
+    }
+
+    /// @dev Review finding: a price rise at the Intake the promise was made under used to leave
+    /// every open promise with no exit but a full refund. Now the bond pays the new price.
+    function test_APriceRiseAtTheProtocolThePromiseWasMadeUnderIsPaidFromTheBond() public {
+        uint256 id = _make();
+        _close(id);
+        vm.roll(vm.getBlockNumber() + vault.SETTLE_DELAY_BLOCKS());
+
+        intake.setPrice(PRICE + 0.1 ether);
+        bytes32 requestId = _ask(id);
+        assertEq(_bond(id), BOND - (PRICE + 0.1 ether));
+        assertEq(imd.balanceOf(payee), PRICE + 0.1 ether);
+        assertEq(uint8(_status(id)), uint8(PinkyVault.Status.Asked));
+
+        _answer(id, requestId, MAX_OUT + 1);
+        vault.payout(id);
+        uint256 left = BOND - (PRICE + 0.1 ether);
+        assertEq(imd.balanceOf(watcher), left / 10, "the verdict was bought and paid out");
+        assertEq(imd.balanceOf(maker), 100 ether - BOND);
+    }
+
+    function test_APriceAboveWhatIsLeftOfTheBondIsStillRefused() public {
+        uint256 id = _make();
+        _close(id);
+        vm.roll(vm.getBlockNumber() + vault.SETTLE_DELAY_BLOCKS());
+        intake.setPrice(BOND + 1);
+        vm.prank(watcher);
+        vm.expectRevert(PinkyVault.InvalidPayment.selector);
+        vault.ask(id);
+
+        intake.setPrice(BOND);
+        vm.prank(watcher);
+        vault.ask(id);
+        assertEq(_bond(id), 0);
+        assertEq(imd.balanceOf(address(vault)), 0);
+    }
+
+    /// @dev Review finding: `ask` refuses a zero price for ever, so `make` must refuse one too or
+    /// the promise can only ever be refunded in full.
+    function test_MakeRefusesAPromiseWhileTheIntakeQuotesZero() public {
+        vm.prank(owner);
+        vault.setProtocol(address(intake), bytes32("oracle.request@oracle-2"));
+        intake.setPrice(0);
+        vm.prank(maker);
+        vm.expectRevert(PinkyVault.InvalidPayment.selector);
+        vault.make(address(token), MAX_OUT, 1 hours, BOND);
+        assertEq(vault.count(), 0);
+        assertEq(imd.balanceOf(maker), 100 ether);
+
+        intake.setPrice(PRICE);
+        vm.prank(maker);
+        uint256 id = vault.make(address(token), MAX_OUT, 1 hours, BOND);
+        _close(id);
+        vm.roll(vm.getBlockNumber() + vault.SETTLE_DELAY_BLOCKS());
+        intake.setPrice(0);
+        vm.expectRevert(PinkyVault.InvalidPayment.selector);
+        vault.ask(id);
     }
 
     function test_RefundAfterThreeUnansweredAttempts() public {

@@ -49,13 +49,17 @@ contract PinkyVault is OracleAttestationConsumer, ReentrancyGuard {
         uint256 observedOut;
     }
 
-    /// @dev What a promise was bought under: the oracle price seen at `make`, which `ask` may not
-    /// exceed, and the smallest panel any of its `ask`s paid for, which the answer is checked
-    /// against rather than the owner's current settings.
+    /// @dev What a promise was bought under: the Intake, action and oracle price seen at `make`,
+    /// and the smallest panel any of its `ask`s paid for, which the answer is checked against
+    /// rather than the owner's current settings. The Intake and action the promise was made under
+    /// may move their price and the bond pays it; any other Intake or action the owner sets later
+    /// is capped at `maxPrice`, so a bond cannot be routed through a greedy one.
     struct Terms {
         uint256 maxPrice;
         uint16 panelSize;
         uint16 quorum;
+        address intake;
+        bytes32 action;
     }
 
     error OnlyOwner();
@@ -151,7 +155,12 @@ contract PinkyVault is OracleAttestationConsumer, ReentrancyGuard {
     {
         if (token.code.length == 0 || token == address(imd)) revert InvalidPromise();
         if (duration < MIN_DURATION || duration > MAX_DURATION) revert InvalidPromise();
-        uint256 price = intake.priceOf(action, address(imd));
+        IIntake intake_ = intake;
+        bytes32 action_ = action;
+        uint256 price = intake_.priceOf(action_, address(imd));
+        // The Intake quotes 0 for an action it does not sell, and `ask` refuses a zero price, so a
+        // promise made under one could never be settled: refuse it here, as `ask` would.
+        if (price == 0) revert InvalidPayment();
         if (bond < minBond || bond < price * MAX_ATTEMPTS) revert BondTooSmall();
 
         uint256 balanceBefore = imd.balanceOf(address(this));
@@ -166,7 +175,10 @@ contract PinkyVault is OracleAttestationConsumer, ReentrancyGuard {
         v.bond = bond;
         v.startBlock = uint64(_chainBlock());
         v.endTime = uint64(block.timestamp + duration);
-        terms[id].maxPrice = price;
+        Terms storage t = terms[id];
+        t.maxPrice = price;
+        t.intake = address(intake_);
+        t.action = action_;
         emit Made(id, msg.sender, token, maxOut, bond, v.startBlock, v.endTime);
     }
 
@@ -196,9 +208,15 @@ contract PinkyVault is OracleAttestationConsumer, ReentrancyGuard {
         if (v.attempts >= MAX_ATTEMPTS) revert NoAttemptsLeft();
 
         IIntake intake_ = intake;
+        bytes32 action_ = action;
         Terms storage t = terms[id];
-        uint256 price = intake_.priceOf(action, address(imd));
-        if (price == 0 || price > v.bond || price > t.maxPrice) revert InvalidPayment();
+        uint256 price = intake_.priceOf(action_, address(imd));
+        if (price == 0 || price > v.bond) revert InvalidPayment();
+        // The Intake and action the promise was made under may have moved their price since, and
+        // the bond pays it. Any other Intake or action the owner has set is held to the price the
+        // promise was made under, so a bond cannot be routed through a greedy one.
+        bool sameProtocol = address(intake_) == t.intake && action_ == t.action;
+        if (!sameProtocol && price > t.maxPrice) revert InvalidPayment();
 
         v.status = Status.Asked;
         v.attempts += 1;
@@ -214,7 +232,7 @@ contract PinkyVault is OracleAttestationConsumer, ReentrancyGuard {
         uint256 balanceBefore = imd.balanceOf(address(this));
         imd.forceApprove(address(intake_), price);
         requestId = intake_.request(
-            action,
+            action_,
             _body(v, panelSize, quorum),
             IIntake.Callback(address(this), this.onOracleResult.selector),
             address(imd),
