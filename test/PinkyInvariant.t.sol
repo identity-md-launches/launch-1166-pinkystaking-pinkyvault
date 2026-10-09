@@ -32,6 +32,50 @@ contract PinkyHandler is Test {
     uint256 public burned;
     uint256 public verdicts;
 
+    /// @dev The state machine as seen after the previous call, to check every transition.
+    mapping(uint256 => PinkyVault.Status) public lastStatus;
+    mapping(uint256 => bool) public lastPaid;
+    mapping(uint256 => uint8) public lastAttempts;
+    /// @dev What each promise was made with.
+    mapping(uint256 => uint256) public bondAt;
+
+    /// @dev Called at the end of every action: a promise only ever moves forward, one step at a
+    /// time, and a settled one never reopens.
+    modifier steps() {
+        _;
+        for (uint256 id = 1; id <= vault.count(); ++id) {
+            (,,,,,,,,, uint8 attempts, PinkyVault.Status now_, bool paid,,,,) = vault.promises(id);
+            PinkyVault.Status was = lastStatus[id];
+            if (now_ != was) {
+                if (was == PinkyVault.Status.Active) {
+                    assertTrue(now_ == PinkyVault.Status.Closed, "Active only closes");
+                } else if (was == PinkyVault.Status.Closed) {
+                    assertTrue(
+                        now_ == PinkyVault.Status.Asked || now_ == PinkyVault.Status.Refunded,
+                        "Closed is asked or refunded"
+                    );
+                } else if (was == PinkyVault.Status.Asked) {
+                    assertTrue(
+                        now_ == PinkyVault.Status.Kept || now_ == PinkyVault.Status.Broken
+                            || now_ == PinkyVault.Status.Refunded,
+                        "Asked ends in a verdict or a refund"
+                    );
+                } else {
+                    assertTrue(false, "a settled promise changed status");
+                }
+            }
+            if (paid) {
+                assertTrue(now_ == PinkyVault.Status.Kept || now_ == PinkyVault.Status.Broken, "paid without a verdict");
+            }
+            assertTrue(!lastPaid[id] || paid, "paid flag cleared");
+            assertGe(attempts, lastAttempts[id], "attempts went down");
+            assertLe(attempts - lastAttempts[id], 1, "attempts jumped");
+            lastStatus[id] = now_;
+            lastPaid[id] = paid;
+            lastAttempts[id] = attempts;
+        }
+    }
+
     constructor(
         PinkyVault vault_,
         PinkyStaking staking_,
@@ -55,31 +99,32 @@ contract PinkyHandler is Test {
         (,,,,,,,,,, s,,,,,) = vault.promises(id);
     }
 
-    function make(uint256 who, uint256 bond, uint256 maxOut, uint256 duration) external {
+    function make(uint256 who, uint256 bond, uint256 maxOut, uint256 duration) external steps {
         address maker = makers[who % 3];
         bond = bound(bond, 5 ether, 50 ether);
         duration = bound(duration, 10 minutes, 30 days);
         imd.mint(maker, bond);
         vm.startPrank(maker);
         imd.approve(address(vault), bond);
-        vault.make(address(token), maxOut, duration, bond);
+        uint256 id = vault.make(address(token), maxOut, duration, bond);
         vm.stopPrank();
         deposited += bond;
+        bondAt[id] = bond;
     }
 
-    function pass(uint256 secs, uint256 blocks) external {
+    function pass(uint256 secs, uint256 blocks) external steps {
         vm.warp(vm.getBlockTimestamp() + bound(secs, 1, 3 days));
         vm.roll(vm.getBlockNumber() + bound(blocks, 1, 100_000));
     }
 
-    function toggleStake(uint256 amount) external {
+    function toggleStake(uint256 amount) external steps {
         vm.startPrank(staker);
         if (staking.balanceOf(staker) == 0) staking.stake(bound(amount, 1, 1_000 ether));
         else staking.unstake(staking.balanceOf(staker));
         vm.stopPrank();
     }
 
-    function close(uint256 seed) external {
+    function close(uint256 seed) external steps {
         uint256 id = _pick(seed);
         if (id == 0 || _status(id) != PinkyVault.Status.Active) return;
         (,,,,,, uint64 endTime,,,,,,,,,) = vault.promises(id);
@@ -87,7 +132,20 @@ contract PinkyHandler is Test {
         vault.close(id);
     }
 
-    function ask(uint256 seed) external {
+    function ask(uint256 seed) external steps {
+        _ask(seed, address(0xA5CE4));
+    }
+
+    /// @dev The maker asking about their own promise: no bounty, and a watcher who re-asks takes
+    /// the asker's seat.
+    function askAsMaker(uint256 seed) external steps {
+        uint256 id = _pick(seed);
+        if (id == 0) return;
+        (address maker,,,,,,,,,,,,,,,) = vault.promises(id);
+        _ask(seed, maker);
+    }
+
+    function _ask(uint256 seed, address who) internal {
         uint256 id = _pick(seed);
         if (id == 0) return;
         PinkyVault.Status s = _status(id);
@@ -98,12 +156,20 @@ contract PinkyHandler is Test {
         if (vm.getBlockNumber() < endBlock + vault.SETTLE_DELAY_BLOCKS()) {
             vm.roll(endBlock + vault.SETTLE_DELAY_BLOCKS());
         }
-        vm.prank(address(0xA5CE4));
+        (,,,,,,,,,,,, address askerBefore,,,) = vault.promises(id);
+        (address maker,,,,,,,,,,,,,,,) = vault.promises(id);
+        vm.prank(who);
         vault.ask(id);
         toIntake += PRICE;
+        (,,,,,,,,,,,, address askerAfter,,,) = vault.promises(id);
+        if (askerBefore == address(0) || askerBefore == maker) {
+            assertEq(askerAfter, who, "the first asker, or the first watcher after a maker, is recorded");
+        } else {
+            assertEq(askerAfter, askerBefore, "a re-ask never replaces a watcher");
+        }
     }
 
-    function answer(uint256 seed, uint256 out) external {
+    function answer(uint256 seed, uint256 out) external steps {
         uint256 id = _pick(seed);
         if (id == 0 || _status(id) != PinkyVault.Status.Asked) return;
         (,,,, uint64 startBlock, uint64 endBlock,,,,,,,,, bytes32 requestId,) = vault.promises(id);
@@ -124,7 +190,7 @@ contract PinkyHandler is Test {
         verdicts += 1;
     }
 
-    function payout(uint256 seed) external {
+    function payout(uint256 seed) external steps {
         uint256 id = _pick(seed);
         if (id == 0) return;
         PinkyVault.Status s = _status(id);
@@ -140,13 +206,19 @@ contract PinkyHandler is Test {
             toMakers += bond;
         } else {
             assertEq(imd.balanceOf(maker), makerBefore, "a broken promise returns nothing");
-            toAskers += imd.balanceOf(asker) - askerBefore;
-            toStakers += imd.balanceOf(address(staking)) - stakingBefore;
-            burned += imd.balanceOf(vault.BURN()) - burnBefore;
+            uint256 bounty = imd.balanceOf(asker) - askerBefore;
+            uint256 shared = imd.balanceOf(address(staking)) - stakingBefore;
+            uint256 burnt = imd.balanceOf(vault.BURN()) - burnBefore;
+            assertEq(bounty, asker == maker ? 0 : bond / 10, "the bounty is a tenth, or nothing for the maker");
+            assertLe(shared, (bond - bounty) / 2, "stakers get at most half the remainder");
+            assertEq(bounty + shared + burnt, bond, "a broken bond is split without remainder");
+            toAskers += bounty;
+            toStakers += shared;
+            burned += burnt;
         }
     }
 
-    function refund(uint256 seed) external {
+    function refund(uint256 seed) external steps {
         uint256 id = _pick(seed);
         if (id == 0) return;
         PinkyVault.Status s = _status(id);
@@ -159,6 +231,8 @@ contract PinkyHandler is Test {
     }
 }
 
+/// forge-config: default.invariant.runs = 256
+/// forge-config: default.invariant.depth = 64
 contract PinkyInvariantTest is Test {
     PinkyVault vault;
     PinkyStaking staking;
@@ -215,5 +289,39 @@ contract PinkyInvariantTest is Test {
             if (paid || status == PinkyVault.Status.Refunded) assertEq(bond, 0);
         }
         assertEq(imd.allowance(address(vault), address(staking)), 0);
+    }
+
+    /// @notice Until it is settled, a bond is exactly the deposit less one oracle fee per ask, and
+    /// no promise is asked more than three times.
+    function invariant_BondIsTheDepositLessTheFeesPaid() public view {
+        for (uint256 id = 1; id <= vault.count(); ++id) {
+            (,,, uint256 bond,,,,,, uint8 attempts, PinkyVault.Status status, bool paid,,,,) = vault.promises(id);
+            assertLe(attempts, vault.MAX_ATTEMPTS());
+            if (!paid && status != PinkyVault.Status.Refunded) {
+                assertEq(bond, handler.bondAt(id) - attempts * 0.5 ether);
+            }
+            if (status == PinkyVault.Status.Active || status == PinkyVault.Status.Closed) assertEq(attempts, 0);
+            if (
+                status == PinkyVault.Status.Asked || status == PinkyVault.Status.Kept
+                    || status == PinkyVault.Status.Broken
+            ) {
+                assertGe(attempts, 1);
+            }
+        }
+    }
+
+    /// @notice A promise never goes backwards: the handler checks each transition, and here the
+    /// count of promises with a verdict equals the verdicts delivered.
+    function invariant_VerdictsAreFinal() public view {
+        uint256 settled;
+        for (uint256 id = 1; id <= vault.count(); ++id) {
+            (,,,,,,,,,, PinkyVault.Status status,, address asker,,,) = vault.promises(id);
+            if (status == PinkyVault.Status.Kept || status == PinkyVault.Status.Broken) {
+                settled += 1;
+                assertTrue(asker != address(0), "a verdict without an asker");
+            }
+            assertEq(uint8(status), uint8(handler.lastStatus(id)), "the handler's view is current");
+        }
+        assertEq(settled, handler.verdicts());
     }
 }
